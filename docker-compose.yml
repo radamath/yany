@@ -1,0 +1,16 @@
+services:
+  yany-relay:
+    build: .
+    image: yany-relay:latest
+    container_name: yany-relay
+    restart: unless-stopped
+    ports:
+      - "6568:6568"
+    volumes:
+      - yany-tls:/data/tls
+    environment:
+      YANY_RELAY_BIND: 0.0.0.0:6568
+      RUST_LOG: info
+
+volumes:
+  yany-tls:

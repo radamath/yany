@@ -1,0 +1,8 @@
+target
+.git
+**/*.pem
+**/*.key
+tls
+.env
+*.password
+host.id

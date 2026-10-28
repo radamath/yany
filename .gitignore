@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.env
+*.pem
+*.key
+*.pfx
+tls/
+.password
+*.password
+host.id

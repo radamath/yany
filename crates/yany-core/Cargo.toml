@@ -1,0 +1,19 @@
+[package]
+name = "yany-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+rand.workspace = true
+blake3.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+zstd.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+tokio.workspace = true

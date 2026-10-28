@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yany-core",
+    "crates/yany-capture",
+    "crates/yany-input",
+    "crates/yany-relay",
+    "crates/yany",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Yany"]
+
+[workspace.dependencies]
+yany-core = { path = "crates/yany-core" }
+yany-capture = { path = "crates/yany-capture" }
+yany-input = { path = "crates/yany-input" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+blake3 = "1"
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+zstd = "0.13"
+clap = { version = "4", features = ["derive", "env"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }

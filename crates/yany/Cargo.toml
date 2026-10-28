@@ -1,0 +1,25 @@
+[package]
+name = "yany"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yany"
+path = "src/main.rs"
+
+[dependencies]
+yany-core.workspace = true
+yany-capture.workspace = true
+yany-input.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+zeroize.workspace = true
+blake3.workspace = true
+minifb = "0.27"

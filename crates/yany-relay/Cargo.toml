@@ -1,0 +1,27 @@
+[package]
+name = "yany-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yany-relay"
+path = "src/main.rs"
+
+[dependencies]
+yany-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
