@@ -1,8 +1,6 @@
 services:
   yany-relay:
-    build: .
-    image: yany-relay:latest
-    container_name: yany-relay
+    image: ghcr.io/radamath/yany-relay:latest
     restart: unless-stopped
     ports:
       - "6568:6568"
