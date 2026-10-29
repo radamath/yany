@@ -298,6 +298,9 @@ async fn agent_read_loop<R: tokio::io::AsyncReadExt + Unpin>(
                     ControlMsg::Reject { session_id, reason } => {
                         reject_call(me, session_id, reason, state).await?;
                     }
+                    ControlMsg::Candidates { session_id, addrs } => {
+                        forward_candidates(me, session_id, addrs, state).await?;
+                    }
                     ControlMsg::Disconnect { .. } => break,
                     ControlMsg::Error { .. } => break,
                     other => {
@@ -448,6 +451,36 @@ async fn reject_call(
                 },
             })
             .await;
+    }
+    Ok(())
+}
+
+async fn forward_candidates(
+    from: HostId,
+    session_id: [u8; 16],
+    addrs: Vec<String>,
+    state: &Arc<Mutex<State>>,
+) -> Result<()> {
+    let dest = {
+        let g = state.lock().await;
+        let Some(pending) = g.sessions.get(&session_id) else {
+            return Ok(());
+        };
+        if from == pending.viewer_id {
+            Some(pending.host_id)
+        } else if from == pending.host_id {
+            Some(pending.viewer_id)
+        } else {
+            None
+        }
+    };
+    if let Some(dest) = dest {
+        send_to(
+            state,
+            dest,
+            ControlMsg::Candidates { session_id, addrs },
+        )
+        .await;
     }
     Ok(())
 }

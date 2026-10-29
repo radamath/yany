@@ -1,6 +1,7 @@
 //! Yany shared protocol, identity, capture/encode traits, and crypto.
 
 pub mod auth;
+pub mod candidate;
 pub mod capture;
 pub mod config;
 pub mod crypto;
@@ -10,6 +11,7 @@ pub mod framing;
 pub mod id;
 pub mod input;
 pub mod join_token;
+pub mod latest;
 pub mod protocol;
 pub mod rate_limit;
 pub mod tile;

@@ -92,6 +92,14 @@ pub enum ControlMsg {
         session_id: [u8; 16],
         id: HostId,
     },
+    Candidates {
+        session_id: [u8; 16],
+        addrs: Vec<String>,
+    },
+    Punch {
+        session_id: [u8; 16],
+        proof: [u8; 16],
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -207,6 +215,9 @@ impl ControlMsg {
                 sanitize_display_name(from_name).map(|_| ())
             }
             ControlMsg::SessionReady { session_secret, .. } => validate_session_secret(session_secret),
+            ControlMsg::Candidates { addrs, .. } => {
+                crate::candidate::sanitize_candidates(addrs).map(|_| ())
+            }
             _ => Ok(()),
         }
     }

@@ -1,5 +1,6 @@
 use crate::config;
 use crate::identity;
+use crate::p2p::{self, Direct};
 use crate::password;
 use crate::session;
 use crate::tls_client;
@@ -177,6 +178,7 @@ async fn run_control(
     let mut live_token = join_token;
     let mut outgoing_password: Option<String> = None;
     let mut pending_secrets: HashMap<[u8; 16], String> = HashMap::new();
+    let mut p2p_inbox: HashMap<[u8; 16], mpsc::Sender<Vec<String>>> = HashMap::new();
     let busy = Arc::new(AtomicBool::new(false));
     let mut result = Once::Retry("control closed".into());
 
@@ -206,12 +208,16 @@ async fn run_control(
                         let secret = pending_secrets
                             .remove(&session_id)
                             .unwrap_or_else(|| live_token.clone());
+                        let (cand_tx, cand_rx) = mpsc::channel(1);
+                        p2p_inbox.insert(session_id, cand_tx);
                         spawn_host_session(
                             enroll.relay.clone(),
                             seen_fp.clone(),
                             id,
                             session_id,
                             secret,
+                            write_tx.clone(),
+                            cand_rx,
                             busy.clone(),
                             ui.clone(),
                         );
@@ -240,12 +246,16 @@ async fn run_control(
                                 break;
                             }
                             pending_secrets.remove(&session_id);
+                            let (cand_tx, cand_rx) = mpsc::channel(1);
+                            p2p_inbox.insert(session_id, cand_tx);
                             spawn_host_session(
                                 enroll.relay.clone(),
                                 seen_fp.clone(),
                                 id,
                                 session_id,
                                 session_password.to_string(),
+                                write_tx.clone(),
+                                cand_rx,
                                 busy.clone(),
                                 ui.clone(),
                             );
@@ -255,15 +265,24 @@ async fn run_control(
                     }
                     Ok(ControlMsg::SessionReady { session_id, session_secret }) => {
                         let secret = outgoing_password.take().unwrap_or(session_secret);
+                        let (cand_tx, cand_rx) = mpsc::channel(1);
+                        p2p_inbox.insert(session_id, cand_tx);
                         spawn_viewer_session(
                             enroll.relay.clone(),
                             seen_fp.clone(),
                             id,
                             session_id,
                             secret,
+                            write_tx.clone(),
+                            cand_rx,
                             busy.clone(),
                             ui.clone(),
                         );
+                    }
+                    Ok(ControlMsg::Candidates { session_id, addrs }) => {
+                        if let Some(tx) = p2p_inbox.remove(&session_id) {
+                            let _ = tx.send(addrs).await;
+                        }
                     }
                     Ok(ControlMsg::Disconnect { reason }) => {
                         result = Once::Retry(reason);
@@ -294,6 +313,8 @@ fn spawn_host_session(
     id: HostId,
     session_id: [u8; 16],
     secret: String,
+    announce: mpsc::Sender<ControlMsg>,
+    peer_rx: mpsc::Receiver<Vec<String>>,
     busy: Arc<AtomicBool>,
     ui: std::sync::mpsc::Sender<UiEvent>,
 ) {
@@ -303,7 +324,8 @@ fn spawn_host_session(
     }
     tokio::spawn(async move {
         let secret = Zeroizing::new(secret);
-        let outcome = host_session(&relay, &fingerprint, id, session_id, &secret).await;
+        let outcome =
+            host_session(&relay, &fingerprint, id, session_id, &secret, announce, peer_rx).await;
         busy.store(false, Ordering::SeqCst);
         match outcome {
             Ok(()) => {
@@ -322,6 +344,8 @@ fn spawn_viewer_session(
     id: HostId,
     session_id: [u8; 16],
     secret: String,
+    announce: mpsc::Sender<ControlMsg>,
+    peer_rx: mpsc::Receiver<Vec<String>>,
     busy: Arc<AtomicBool>,
     ui: std::sync::mpsc::Sender<UiEvent>,
 ) {
@@ -331,7 +355,16 @@ fn spawn_viewer_session(
     }
     tokio::spawn(async move {
         let secret = Zeroizing::new(secret);
-        let outcome = viewer_session(&relay, &fingerprint, id, session_id, &secret).await;
+        let outcome = viewer_session(
+            &relay,
+            &fingerprint,
+            id,
+            session_id,
+            &secret,
+            announce,
+            peer_rx,
+        )
+        .await;
         busy.store(false, Ordering::SeqCst);
         match outcome {
             Ok(()) => {
@@ -350,7 +383,24 @@ async fn host_session(
     id: HostId,
     session_id: [u8; 16],
     secret: &str,
+    announce: mpsc::Sender<ControlMsg>,
+    peer_rx: mpsc::Receiver<Vec<String>>,
 ) -> Result<()> {
+    if let Some(direct) = p2p::try_direct(session_id, secret, announce, peer_rx).await {
+        let direct_ok = match direct {
+            Direct::Tcp(p) => {
+                session::host_handshake_and_media(p.reader, p.writer, secret, CaptureKind::Dxgi)
+                    .await
+            }
+            Direct::Udp(p) => {
+                session::host_handshake_and_media_udp(p, secret, CaptureKind::Dxgi).await
+            }
+        };
+        match direct_ok {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("direct tunnel failed, relay fallback: {e:#}"),
+        }
+    }
     let tls = tls_client::connect(relay, fingerprint).await?;
     let (reader, mut writer) = split(tls);
     write_msg(
@@ -375,7 +425,19 @@ async fn viewer_session(
     id: HostId,
     session_id: [u8; 16],
     secret: &str,
+    announce: mpsc::Sender<ControlMsg>,
+    peer_rx: mpsc::Receiver<Vec<String>>,
 ) -> Result<()> {
+    if let Some(direct) = p2p::try_direct(session_id, secret, announce, peer_rx).await {
+        let direct_ok = match direct {
+            Direct::Tcp(p) => session::viewer_handshake_and_media(p.reader, p.writer, secret).await,
+            Direct::Udp(p) => session::viewer_handshake_and_media_udp(p, secret).await,
+        };
+        match direct_ok {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("direct tunnel failed, relay fallback: {e:#}"),
+        }
+    }
     let tls = tls_client::connect(relay, fingerprint).await?;
     let (reader, mut writer) = split(tls);
     write_msg(

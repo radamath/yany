@@ -1,5 +1,7 @@
+use crate::pipe::{MsgPipe, StreamPipe, UdpPipe, UdpRecv, UdpSend};
 use anyhow::{bail, Context, Result};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -9,14 +11,15 @@ use yany_core::capture::{CaptureBackend, Frame};
 use yany_core::config::CaptureKind;
 use yany_core::crypto::SessionKeys;
 use yany_core::encode::{FrameDecoder, FrameEncoder, ZstdTileCodec};
-use yany_core::framing::{read_control, read_msg, write_msg};
+use yany_core::framing::{read_msg, write_msg};
 use yany_core::input::{clamp_axis, InputEvent};
+use yany_core::latest::LatestSlot;
 use yany_core::protocol::ControlMsg;
 use yany_core::tile::TileFrame;
 
 pub async fn host_handshake_and_media<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     password: &str,
     capture: CaptureKind,
 ) -> Result<()>
@@ -24,15 +27,8 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let nonce = random_bytes::<32>();
-    write_msg(&mut writer, &ControlMsg::Challenge { nonce }).await?;
-    let keys = SessionKeys::derive(password, &nonce, true)?;
-    match read_control(&mut reader).await? {
-        ControlMsg::Auth { proof } => keys.verify_auth_proof(&proof)?,
-        ControlMsg::Disconnect { reason } => bail!("viewer left: {reason}"),
-        other => bail!("expected auth, got {other:?}"),
-    }
-    write_msg(&mut writer, &ControlMsg::AuthOk).await?;
+    let mut pipe = StreamPipe { reader, writer };
+    let keys = handshake_keys(|| host_keys(&mut pipe, password)).await?;
     let cap = open_capture(capture)
         .or_else(|_| open_capture(CaptureKind::Gdi))
         .with_context(|| {
@@ -41,33 +37,86 @@ where
                 capture.as_str()
             )
         })?;
-    host_media(reader, writer, keys, cap).await
+    host_media(pipe.reader, pipe.writer, keys, cap).await
+}
+
+pub async fn host_handshake_and_media_udp(
+    mut pipe: UdpPipe,
+    password: &str,
+    capture: CaptureKind,
+) -> Result<()> {
+    let keys = handshake_keys(|| host_keys(&mut pipe, password)).await?;
+    let cap = open_capture(capture)
+        .or_else(|_| open_capture(CaptureKind::Gdi))
+        .with_context(|| {
+            format!(
+                "capture backend '{}' failed — try --capture gdi",
+                capture.as_str()
+            )
+        })?;
+    let (recv, send) = pipe.into_split();
+    host_media_udp(recv, send, keys, cap).await
+}
+
+async fn handshake_keys<F, Fut>(op: F) -> Result<SessionKeys>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<SessionKeys>>,
+{
+    tokio::time::timeout(Duration::from_secs(8), op())
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timeout"))?
+}
+
+async fn host_keys<P: MsgPipe>(pipe: &mut P, password: &str) -> Result<SessionKeys> {
+    let nonce = random_bytes::<32>();
+    pipe.send_msg(&ControlMsg::Challenge { nonce }).await?;
+    let keys = SessionKeys::derive(password, &nonce, true)?;
+    match pipe.recv_msg().await? {
+        ControlMsg::Auth { proof } => keys.verify_auth_proof(&proof)?,
+        ControlMsg::Disconnect { reason } => bail!("viewer left: {reason}"),
+        other => bail!("expected auth, got {other:?}"),
+    }
+    pipe.send_msg(&ControlMsg::AuthOk).await?;
+    Ok(keys)
 }
 
 pub async fn viewer_handshake_and_media<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     password: &str,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let challenge = match read_control(&mut reader).await? {
+    let mut pipe = StreamPipe { reader, writer };
+    let keys = handshake_keys(|| viewer_keys(&mut pipe, password)).await?;
+    viewer_media(pipe.reader, pipe.writer, keys).await
+}
+
+pub async fn viewer_handshake_and_media_udp(mut pipe: UdpPipe, password: &str) -> Result<()> {
+    let keys = handshake_keys(|| viewer_keys(&mut pipe, password)).await?;
+    let (recv, send) = pipe.into_split();
+    viewer_media_udp(recv, send, keys).await
+}
+
+async fn viewer_keys<P: MsgPipe>(pipe: &mut P, password: &str) -> Result<SessionKeys> {
+    let challenge = match pipe.recv_msg().await? {
         ControlMsg::Challenge { nonce } => nonce,
         ControlMsg::Error { message } => bail!("relay: {message}"),
         other => bail!("expected challenge, got {other:?}"),
     };
     let keys = SessionKeys::derive(password, &challenge, false)?;
     let proof = SessionKeys::auth_proof(password, &challenge)?;
-    write_msg(&mut writer, &ControlMsg::Auth { proof }).await?;
-    match read_control(&mut reader).await? {
+    pipe.send_msg(&ControlMsg::Auth { proof }).await?;
+    match pipe.recv_msg().await? {
         ControlMsg::AuthOk => {}
         ControlMsg::AuthFail => bail!("authentication failed"),
         ControlMsg::Error { message } => bail!("relay: {message}"),
         other => bail!("expected AuthOk, got {other:?}"),
     }
-    viewer_media(reader, writer, keys).await
+    Ok(keys)
 }
 
 pub async fn host_media<R, W>(
@@ -80,39 +129,48 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Frame>(2);
+    let slot = Arc::new(LatestSlot::new());
+    let ping = Arc::new(tokio::sync::Notify::new());
+    let slot_c = slot.clone();
+    let ping_c = ping.clone();
     std::thread::Builder::new()
         .name("yany-capture".into())
-        .spawn(move || capture_loop(cap, frame_tx))
+        .spawn(move || capture_loop(cap, slot_c, ping_c))
         .context("capture thread")?;
 
     let mut encoder = ZstdTileCodec::default_realtime();
     let mut frame_seq = 1u64;
     let mut last_input_seq = 0u64;
     loop {
-        tokio::select! {
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else { break; };
-                let tiles = encoder.encode(&frame)?;
-                let ciphertext = keys.seal_bincode(frame_seq, b"yany-frame", &tiles)?;
-                write_msg(&mut writer, &ControlMsg::Frame { seq: frame_seq, ciphertext }).await?;
-                frame_seq = frame_seq.wrapping_add(1);
-                if frame_seq == 0 {
-                    frame_seq = 1;
-                }
+        if let Some(frame) = slot.take() {
+            let tiles = encoder.encode(&frame)?;
+            if tiles.tiles.is_empty() {
+                continue;
             }
+            let ciphertext = keys.seal_bincode(frame_seq, b"yany-frame", &tiles)?;
+            write_msg(&mut writer, &ControlMsg::Frame { seq: frame_seq, ciphertext }).await?;
+            frame_seq = frame_seq.wrapping_add(1);
+            if frame_seq == 0 {
+                frame_seq = 1;
+            }
+            continue;
+        }
+        tokio::select! {
+            biased;
             msg = read_msg(&mut reader) => {
                 match msg? {
                     ControlMsg::Input { seq, ciphertext } => {
                         if seq <= last_input_seq {
-                            bail!("replayed input seq {seq}");
+                            continue;
                         }
                         last_input_seq = seq;
                         let events: Vec<InputEvent> = keys.open_bincode(seq, b"yany-input", &ciphertext)?;
                         if events.len() > 64 {
                             bail!("input batch too large");
                         }
-                        yany_input::inject(&events)?;
+                        if let Err(e) = yany_input::inject(&events) {
+                            tracing::warn!("inject: {e}");
+                        }
                     }
                     ControlMsg::Disconnect { reason } => {
                         tracing::info!("viewer disconnected: {reason}");
@@ -122,6 +180,66 @@ where
                     other => bail!("unexpected host msg {other:?}"),
                 }
             }
+            _ = ping.notified() => {}
+        }
+    }
+    Ok(())
+}
+
+async fn host_media_udp(
+    mut recv: UdpRecv,
+    mut send: UdpSend,
+    keys: SessionKeys,
+    cap: Box<dyn CaptureBackend>,
+) -> Result<()> {
+    let slot = Arc::new(LatestSlot::new());
+    let ping = Arc::new(tokio::sync::Notify::new());
+    let slot_c = slot.clone();
+    let ping_c = ping.clone();
+    std::thread::Builder::new()
+        .name("yany-capture".into())
+        .spawn(move || capture_loop(cap, slot_c, ping_c))
+        .context("capture thread")?;
+    let mut encoder = ZstdTileCodec::default_realtime();
+    let mut frame_seq = 1u64;
+    let mut last_input_seq = 0u64;
+    loop {
+        if let Some(frame) = slot.take() {
+            let tiles = encoder.encode(&frame)?;
+            if tiles.tiles.is_empty() {
+                continue;
+            }
+            let ciphertext = keys.seal_bincode(frame_seq, b"yany-frame", &tiles)?;
+            send.send_msg(&ControlMsg::Frame { seq: frame_seq, ciphertext })
+                .await?;
+            frame_seq = frame_seq.wrapping_add(1);
+            if frame_seq == 0 {
+                frame_seq = 1;
+            }
+            continue;
+        }
+        tokio::select! {
+            biased;
+            msg = recv.recv_msg() => {
+                match msg? {
+                    ControlMsg::Input { seq, ciphertext } => {
+                        if seq <= last_input_seq {
+                            continue;
+                        }
+                        last_input_seq = seq;
+                        let events: Vec<InputEvent> = keys.open_bincode(seq, b"yany-input", &ciphertext)?;
+                        if events.len() > 64 {
+                            bail!("input batch too large");
+                        }
+                        if let Err(e) = yany_input::inject(&events) {
+                            tracing::warn!("inject: {e}");
+                        }
+                    }
+                    ControlMsg::Disconnect { .. } => break,
+                    other => bail!("unexpected host msg {other:?}"),
+                }
+            }
+            _ = ping.notified() => {}
         }
     }
     Ok(())
@@ -136,7 +254,8 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
+    let slot = Arc::new(LatestSlot::new());
+    let slot_r = slot.clone();
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<InputEvent>>(8);
     let keys_read = keys.clone();
     let read_task = tokio::spawn(async move {
@@ -146,13 +265,13 @@ where
             match read_msg(&mut reader).await {
                 Ok(ControlMsg::Frame { seq, ciphertext }) => {
                     if seq <= last_frame_seq {
-                        bail!("replayed frame seq {seq}");
+                        continue;
                     }
                     last_frame_seq = seq;
                     let tiles: TileFrame =
                         keys_read.open_bincode(seq, b"yany-frame", &ciphertext)?;
                     let frame = decoder.decode(&tiles)?;
-                    let _ = frame_tx.send(frame);
+                    slot_r.push(frame);
                 }
                 Ok(ControlMsg::Disconnect { reason }) => {
                     tracing::info!("host disconnected: {reason}");
@@ -179,13 +298,61 @@ where
         Ok::<_, anyhow::Error>(())
     });
 
-    tokio::task::spawn_blocking(move || ui_loop(frame_rx, input_tx)).await??;
+    tokio::task::spawn_blocking(move || ui_loop(slot, input_tx)).await??;
     read_task.abort();
     write_task.abort();
     Ok(())
 }
 
-fn capture_loop(mut cap: Box<dyn CaptureBackend>, tx: tokio::sync::mpsc::Sender<Frame>) {
+async fn viewer_media_udp(mut recv: UdpRecv, mut send: UdpSend, keys: SessionKeys) -> Result<()> {
+    let slot = Arc::new(LatestSlot::new());
+    let slot_r = slot.clone();
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<InputEvent>>(8);
+    let keys_read = keys.clone();
+    let read_task = tokio::spawn(async move {
+        let mut decoder = ZstdTileCodec::default_realtime();
+        let mut last_frame_seq = 0u64;
+        loop {
+            match recv.recv_msg().await {
+                Ok(ControlMsg::Frame { seq, ciphertext }) => {
+                    if seq <= last_frame_seq {
+                        continue;
+                    }
+                    last_frame_seq = seq;
+                    let tiles: TileFrame =
+                        keys_read.open_bincode(seq, b"yany-frame", &ciphertext)?;
+                    slot_r.push(decoder.decode(&tiles)?);
+                }
+                Ok(ControlMsg::Disconnect { .. }) => break,
+                Ok(other) => bail!("unexpected viewer msg {other:?}"),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    });
+    let write_task = tokio::spawn(async move {
+        let mut seq = 1u64;
+        while let Some(events) = input_rx.recv().await {
+            let ciphertext = keys.seal_bincode(seq, b"yany-input", &events)?;
+            send.send_msg(&ControlMsg::Input { seq, ciphertext }).await?;
+            seq = seq.wrapping_add(1);
+            if seq == 0 {
+                seq = 1;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    tokio::task::spawn_blocking(move || ui_loop(slot, input_tx)).await??;
+    read_task.abort();
+    write_task.abort();
+    Ok(())
+}
+
+fn capture_loop(
+    mut cap: Box<dyn CaptureBackend>,
+    slot: Arc<LatestSlot<Frame>>,
+    ping: Arc<tokio::sync::Notify>,
+) {
     if let Err(e) = cap.start() {
         tracing::error!("capture start: {e}");
         return;
@@ -193,9 +360,8 @@ fn capture_loop(mut cap: Box<dyn CaptureBackend>, tx: tokio::sync::mpsc::Sender<
     loop {
         match cap.next_frame() {
             Ok(Some(frame)) => {
-                if tx.blocking_send(frame).is_err() {
-                    break;
-                }
+                slot.push(frame);
+                ping.notify_one();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(1)),
             Err(e) => {
@@ -207,7 +373,7 @@ fn capture_loop(mut cap: Box<dyn CaptureBackend>, tx: tokio::sync::mpsc::Sender<
 }
 
 fn ui_loop(
-    frames: std::sync::mpsc::Receiver<Frame>,
+    frames: Arc<LatestSlot<Frame>>,
     input_tx: mpsc::Sender<Vec<InputEvent>>,
 ) -> Result<()> {
     let mut window = Window::new(
@@ -226,16 +392,16 @@ fn ui_loop(
     let mut prev_left = false;
     let mut prev_right = false;
     let mut prev_keys: Vec<Key> = Vec::new();
+    let mut prev_mouse: Option<(u16, u16)> = None;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        while let Ok(frame) = frames.try_recv() {
+        if let Some(frame) = frames.take() {
             width = frame.width as usize;
             height = frame.height as usize;
-            if width == 0 || height == 0 {
-                continue;
+            if width > 0 && height > 0 {
+                buf = bgra_to_u32(&frame.bgra);
+                let _ = window.update_with_buffer(&buf, width, height);
             }
-            buf = bgra_to_u32(&frame.bgra);
-            let _ = window.update_with_buffer(&buf, width, height);
         }
         if buf.len() == width.saturating_mul(height) && width > 0 {
             let _ = window.update_with_buffer(&buf, width, height);
@@ -249,7 +415,10 @@ fn ui_loop(
             if ww > 1 && wh > 1 {
                 let x = clamp_axis(((mx / (ww - 1) as f32) * 65535.0) as i32);
                 let y = clamp_axis(((my / (wh - 1) as f32) * 65535.0) as i32);
-                events.push(InputEvent::MouseMove { x, y });
+                if prev_mouse != Some((x, y)) {
+                    events.push(InputEvent::MouseMove { x, y });
+                    prev_mouse = Some((x, y));
+                }
             }
         }
         let left = window.get_mouse_down(MouseButton::Left);
@@ -293,7 +462,7 @@ fn ui_loop(
         }
         prev_keys = held;
         if !events.is_empty() {
-            let _ = input_tx.blocking_send(events);
+            let _ = input_tx.try_send(events);
         }
         std::thread::sleep(Duration::from_millis(1));
     }

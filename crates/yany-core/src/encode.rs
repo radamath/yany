@@ -34,7 +34,7 @@ impl ZstdTileCodec {
     }
 
     pub fn default_realtime() -> Self {
-        Self::new(DEFAULT_TILE, 1).expect("static defaults")
+        Self::new(DEFAULT_TILE, -1).expect("static defaults")
     }
 }
 

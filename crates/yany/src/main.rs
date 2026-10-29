@@ -3,6 +3,8 @@ mod config;
 mod host;
 mod identity;
 mod password;
+mod p2p;
+mod pipe;
 mod session;
 mod tls_client;
 mod ui;
