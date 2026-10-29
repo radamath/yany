@@ -8,6 +8,7 @@ services:
       - yany-tls:/data/tls
     environment:
       YANY_RELAY_BIND: 0.0.0.0:6568
+      YANY_JOIN_TOKEN_FILE: /data/tls/join.token
       RUST_LOG: info
 
 volumes:

@@ -34,6 +34,10 @@ impl HostId {
         self.0
     }
 
+    pub fn is_valid(self) -> bool {
+        (Self::MIN..=Self::MAX).contains(&self.0)
+    }
+
     pub fn display_groups(self) -> String {
         let s = format!("{:09}", self.0);
         format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9])
@@ -86,5 +90,6 @@ mod tests {
         assert!("12345678".parse::<HostId>().is_err());
         assert!(HostId::from_raw(99999999).is_err());
         assert!("abcdefghi".parse::<HostId>().is_err());
+        assert!(HostId::from_raw(123456789).unwrap().is_valid());
     }
 }

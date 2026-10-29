@@ -8,6 +8,10 @@ license.workspace = true
 name = "yany-relay"
 path = "src/main.rs"
 
+[[bin]]
+name = "yany-token"
+path = "src/token_main.rs"
+
 [dependencies]
 yany-core.workspace = true
 anyhow.workspace = true
